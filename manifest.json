@@ -1,0 +1,11 @@
+{
+  "id": "arbor",
+  "name": "Arbor",
+  "version": "0.3.1-beta.1",
+  "minAppVersion": "1.7.2",
+  "description": "Write branching Markdown cards on desktop and mobile while keeping a normal note as the source of truth.",
+  "author": "Kpyruy",
+  "authorUrl": "https://github.com/Kpyruy",
+  "fundingUrl": "https://buymeacoffee.com/kpyr",
+  "isDesktopOnly": false
+}
