@@ -27823,6 +27823,95 @@ function anchorCompensation(before, after, fraction, midpointDelta) {
   };
 }
 
+// src/view/branch/TouchColumnViewport.ts
+var TouchColumnViewport = class {
+  constructor() {
+    this.positions = /* @__PURE__ */ new Map();
+    this.paused = false;
+  }
+  align(list, target, instant, force = false) {
+    this.prune();
+    if (this.paused || list.clientHeight <= 0) return;
+    let position = this.positions.get(list);
+    const changedTarget = position?.target !== target;
+    const initial = !position;
+    if (!position) {
+      const created = { list, target, paddingTop: 0, paddingBottom: 0, desired: null, manual: false, stopTracking: () => {
+      } };
+      const manualInput = (event) => {
+        if (event.type !== "touchstart" || event.touches.length === 1) created.manual = true;
+      };
+      list.addEventListener("touchstart", manualInput, { passive: true });
+      list.addEventListener("wheel", manualInput, { passive: true });
+      created.stopTracking = () => {
+        list.removeEventListener("touchstart", manualInput);
+        list.removeEventListener("wheel", manualInput);
+      };
+      position = created;
+      this.positions.set(list, position);
+    }
+    position.target = target;
+    if (changedTarget || instant || force) position.manual = false;
+    this.measure(position, !initial);
+    const desired = this.targetTop(position);
+    if (initial || changedTarget || instant || force || position.desired === null || !position.manual && Math.abs(desired - position.desired) > 0.5) {
+      const reduced = list.win.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      list.scrollTo({ top: desired, behavior: initial || instant || reduced ? "instant" : "smooth" });
+    }
+    position.desired = desired;
+  }
+  refresh() {
+    this.prune();
+    if (this.paused) return;
+    for (const position of this.positions.values()) {
+      if (position.list.clientHeight <= 0) continue;
+      this.measure(position, true);
+      position.desired = this.targetTop(position);
+    }
+  }
+  pause(paused) {
+    this.paused = paused;
+    if (paused) {
+      for (const { list } of this.positions.values()) {
+        list.scrollTo({ top: list.scrollTop, behavior: "instant" });
+      }
+    } else this.refresh();
+  }
+  reset() {
+    for (const position of this.positions.values()) position.stopTracking();
+    this.positions.clear();
+    this.paused = false;
+  }
+  measure(position, preserve) {
+    const { list } = position;
+    const first = list.firstElementChild;
+    const last2 = list.lastElementChild;
+    const top = Math.max(0, list.clientHeight * 0.44 - (first?.offsetHeight ?? 0) / 2);
+    const bottom = Math.max(0, list.clientHeight * 0.56 - (last2?.offsetHeight ?? 0) / 2);
+    if (Math.abs(top - position.paddingTop) < 0.5 && Math.abs(bottom - position.paddingBottom) < 0.5) return;
+    const delta = preserve ? top - position.paddingTop : 0;
+    if (delta < 0) list.scrollTop += delta;
+    list.setCssProps({ "--arbor-touch-list-top": `${top}px`, "--arbor-touch-list-bottom": `${bottom}px` });
+    if (delta > 0) list.scrollTop += delta;
+    if (position.desired !== null) position.desired += delta;
+    position.paddingTop = top;
+    position.paddingBottom = bottom;
+  }
+  targetTop({ list, target }) {
+    const top = list.scrollTop + target.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    const desired = target.offsetHeight > list.clientHeight - 48 ? top - 24 : top + target.offsetHeight / 2 - list.clientHeight * 0.44;
+    return Math.max(0, Math.min(desired, list.scrollHeight - list.clientHeight));
+  }
+  prune() {
+    for (const [list, position] of this.positions) {
+      if (!list.isConnected || !position.target.isConnected || !list.contains(position.target)) {
+        position.stopTracking();
+        this.positions.delete(list);
+      }
+    }
+  }
+};
+
 // src/view/branch/BranchViewportController.ts
 var BranchViewportController = class {
   constructor(port) {
@@ -27834,6 +27923,7 @@ var BranchViewportController = class {
     this.alignments = /* @__PURE__ */ new WeakMap();
     this.panState = null;
     this.pinch = null;
+    this.touchColumns = new TouchColumnViewport();
   }
   beginBranchPinch(viewport, midpoint) {
     this.stopHorizontalScrollMotion(false);
@@ -27847,8 +27937,10 @@ var BranchViewportController = class {
       this.pinch = null;
       return;
     }
+    const vertical = this.port.usesTouchControls?.() && !this.port.isCompact() ? card.closest(".arbor-card-list") ?? viewport : viewport;
+    this.touchColumns.pause(true);
     const before = card.getBoundingClientRect();
-    this.pinch = { viewport, card, before, midpoint, fraction: {
+    this.pinch = { viewport, vertical, card, before, midpoint, fraction: {
       x: Math.max(0, Math.min(1, (bounds.left + midpoint.x - before.left) / Math.max(1, before.width))),
       y: Math.max(0, Math.min(1, (bounds.top + midpoint.y - before.top) / Math.max(1, before.height)))
     } };
@@ -27862,13 +27954,17 @@ var BranchViewportController = class {
       y: midpoint.y - anchor.midpoint.y
     });
     viewport.scrollLeft += delta.left;
-    viewport.scrollTop += delta.top;
+    anchor.vertical.scrollTop += delta.top;
     anchor.before = anchor.card.getBoundingClientRect();
     anchor.midpoint = midpoint;
     this.syncViewportEdgeFades();
   }
   endBranchPinch() {
     this.pinch = null;
+    this.touchColumns.pause(false);
+  }
+  refreshTouchColumns() {
+    this.touchColumns.refresh();
   }
   revealCompactSelection() {
     if (this.pinch) return;
@@ -27990,6 +28086,10 @@ var BranchViewportController = class {
       this.revealCompactSelection();
       return;
     }
+    if (this.port.usesTouchControls?.()) {
+      const list = card.closest(".arbor-card-list");
+      if (list) this.touchColumns.align(list, card, snap, true);
+    }
     const { columns } = this.port.getElements();
     const viewportRect = viewport.getBoundingClientRect();
     const cardRect = card.getBoundingClientRect();
@@ -28050,6 +28150,10 @@ var BranchViewportController = class {
       const block = path[depth];
       const target = (activeZoom ? column.querySelector(".arbor-card.is-active") : null) ?? (block ? column.querySelector(`.arbor-card[data-block-id="${block.id}"]`) : null) ?? column.querySelector(".arbor-column-empty") ?? fallback;
       if (!target) return;
+      if (this.port.usesTouchControls?.() && !this.port.isCompact()) {
+        this.touchColumns.align(list, target, activeZoom);
+        return;
+      }
       const natural = this.getElementOffsetTopWithin(target, resolvedColumns) + target.offsetHeight / 2;
       const preferred = depth === 0 ? rootAnchor : centers.get(depth - 1) ?? natural;
       const anchor = target.classList.contains("is-active") ? clampCardCenter(preferred, target.offsetHeight, viewportRect.top - rootRect.top, resolvedViewport.clientHeight) : preferred;
@@ -28113,6 +28217,7 @@ var BranchViewportController = class {
   }
   reset() {
     this.pinch = null;
+    this.touchColumns.reset();
     this.alignments = /* @__PURE__ */ new WeakMap();
     if (this.focusFrame !== null) window.cancelAnimationFrame(this.focusFrame);
     if (this.layoutFrame !== null) window.cancelAnimationFrame(this.layoutFrame);
@@ -31999,6 +32104,7 @@ var ArborView = class extends import_obsidian16.FileView {
       tryHandleCardLink: (event, card) => this.cardLinks.handleActivation(event, card)
     }, () => this.getOverviewOrientation(), () => this.contentEl.win);
     this.branchViewport = new BranchViewportController({
+      usesTouchControls: () => this.usesTouchControls,
       isActiveZoom: () => this.activeZoom.isEnabled(),
       read: {
         getState: () => this.getNavigationState(),
@@ -32538,6 +32644,7 @@ var ArborView = class extends import_obsidian16.FileView {
     this.contentEl.querySelectorAll("textarea.arbor-editor").forEach((editor) => this.resizeEditor(editor));
   }
   revealSelectionAfterShellResize() {
+    if (this.presentationMode === "editor") this.branchViewport.refreshTouchColumns();
     if (this.activeZoom.isEnabled()) {
       this.activeZoom.schedule();
       return;

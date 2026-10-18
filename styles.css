@@ -2882,6 +2882,26 @@
 .arbor-view.has-touch-controls .arbor-editor { font-size: 16px; min-height: 80px; touch-action: pan-y; }
 .arbor-view.is-compact .arbor-card.is-editing .arbor-editor { max-height: none; }
 .arbor-view.is-compact .arbor-columns-viewport.is-touch-pinching { overscroll-behavior: contain; }
+.arbor-view.has-touch-controls:not(.is-compact) .arbor-columns {
+  height: 100%;
+  min-height: 0;
+  padding-block: 0;
+}
+.arbor-view.has-touch-controls:not(.is-compact) .arbor-column { height: 100%; min-height: 0; }
+.arbor-view.has-touch-controls:not(.is-compact) .arbor-card-list {
+  box-sizing: border-box;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  padding: var(--arbor-touch-list-top, 0px) 4px var(--arbor-touch-list-bottom, 0px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-width: thin;
+  transform: none;
+}
+.arbor-view.has-touch-controls:not(.is-compact) .arbor-card { flex-shrink: 0; }
+.arbor-view.has-touch-controls:not(.is-compact) .arbor-card.is-active .arbor-card-content { overscroll-behavior-y: auto; }
 .arbor-view.has-touch-controls .arbor-columns-viewport.is-touch-pinching .arbor-card-list {
   transition: none;
 }
