@@ -27815,6 +27815,14 @@ var LocalHeadingLinks = class {
   }
 };
 
+// src/view/interaction/pinchAnchor.ts
+function anchorCompensation(before, after, fraction, midpointDelta) {
+  return {
+    left: after.left + fraction.x * after.width - before.left - fraction.x * before.width - midpointDelta.x,
+    top: after.top + fraction.y * after.height - before.top - fraction.y * before.height - midpointDelta.y
+  };
+}
+
 // src/view/branch/BranchViewportController.ts
 var BranchViewportController = class {
   constructor(port) {
@@ -27825,8 +27833,45 @@ var BranchViewportController = class {
     this.horizontalTarget = null;
     this.alignments = /* @__PURE__ */ new WeakMap();
     this.panState = null;
+    this.pinch = null;
+  }
+  beginBranchPinch(viewport, midpoint) {
+    this.stopHorizontalScrollMotion(false);
+    if (this.layoutFrame !== null) window.cancelAnimationFrame(this.layoutFrame);
+    if (this.focusFrame !== null) window.cancelAnimationFrame(this.focusFrame);
+    this.layoutFrame = this.focusFrame = null;
+    const bounds = viewport.getBoundingClientRect();
+    const hit = viewport.ownerDocument.elementFromPoint?.(bounds.left + midpoint.x, bounds.top + midpoint.y);
+    const card = hit?.closest(".arbor-card") ?? viewport.querySelector(".arbor-card.is-active");
+    if (!card || !viewport.contains(card)) {
+      this.pinch = null;
+      return;
+    }
+    const before = card.getBoundingClientRect();
+    this.pinch = { viewport, card, before, midpoint, fraction: {
+      x: Math.max(0, Math.min(1, (bounds.left + midpoint.x - before.left) / Math.max(1, before.width))),
+      y: Math.max(0, Math.min(1, (bounds.top + midpoint.y - before.top) / Math.max(1, before.height)))
+    } };
+  }
+  commitBranchPinch(viewport, midpoint) {
+    const anchor = this.pinch;
+    if (!anchor || anchor.viewport !== viewport || !anchor.card.isConnected) return;
+    const after = anchor.card.getBoundingClientRect();
+    const delta = anchorCompensation(anchor.before, after, anchor.fraction, {
+      x: midpoint.x - anchor.midpoint.x,
+      y: midpoint.y - anchor.midpoint.y
+    });
+    viewport.scrollLeft += delta.left;
+    viewport.scrollTop += delta.top;
+    anchor.before = anchor.card.getBoundingClientRect();
+    anchor.midpoint = midpoint;
+    this.syncViewportEdgeFades();
+  }
+  endBranchPinch() {
+    this.pinch = null;
   }
   revealCompactSelection() {
+    if (this.pinch) return;
     if (!this.port.isCompact()) return;
     const { viewport, columns } = this.port.getElements();
     const card = columns?.querySelector(".arbor-card.is-active");
@@ -27837,6 +27882,7 @@ var BranchViewportController = class {
     if (Math.abs(offset) > 1) viewport.scrollTop += offset;
   }
   scheduleColumnAlignment() {
+    if (this.pinch) return;
     if (this.layoutFrame !== null) {
       window.cancelAnimationFrame(this.layoutFrame);
     }
@@ -27972,6 +28018,7 @@ var BranchViewportController = class {
     this.animateViewportScrollTo(viewport, targetLeft);
   }
   alignColumnsToActivePath() {
+    if (this.pinch) return;
     const { viewport, columns } = this.port.getElements();
     if (this.port.isCompact() && !this.port.isActiveZoom?.()) {
       columns?.querySelectorAll(".arbor-card-list").forEach((list) => {
@@ -28065,6 +28112,7 @@ var BranchViewportController = class {
     }
   }
   reset() {
+    this.pinch = null;
     this.alignments = /* @__PURE__ */ new WeakMap();
     if (this.focusFrame !== null) window.cancelAnimationFrame(this.focusFrame);
     if (this.layoutFrame !== null) window.cancelAnimationFrame(this.layoutFrame);
@@ -28256,20 +28304,32 @@ var ZoomController = class {
     this.touchZoomFrame = null;
     this.pendingTouchZoom = null;
   }
-  updateZoomLevel(nextZoomLevel) {
+  updateZoomLevel(nextZoomLevel, options) {
+    const source = options?.source ?? "manual";
+    if (source === "manual") {
+      this.clearTouchZoomFrame();
+      this.clearOverviewZoomFrame();
+    }
     this.port.onManualZoom?.();
     const clamped = clampZoomLevel(Number(nextZoomLevel.toFixed(3)), this.port.getZoomBounds?.());
     if (Math.abs(clamped - this.port.getZoom()) < 1e-3) {
+      if (options?.commitViewport) {
+        this.port.afterZoom(source);
+        options.commitViewport();
+      }
       return;
     }
     this.port.setZoom(clamped);
     this.port.applyZoom();
     this.scheduleZoomPersist();
     this.flashZoomIndicator();
-    this.port.afterZoom();
+    this.port.afterZoom(source);
+    options?.commitViewport?.();
   }
-  scheduleTouchZoom(nextZoom) {
-    this.pendingTouchZoom = nextZoom;
+  scheduleTouchZoom(nextZoom, commitViewport) {
+    this.clearOverviewZoomFrame();
+    this.port.onManualZoom?.();
+    this.pendingTouchZoom = { zoom: nextZoom, commitViewport };
     if (this.touchZoomFrame !== null) {
       return;
     }
@@ -28278,15 +28338,18 @@ var ZoomController = class {
     request.id = request.owner.requestAnimationFrame(() => {
       if (this.touchZoomFrame !== request) return;
       this.touchZoomFrame = null;
-      const zoom = this.pendingTouchZoom;
-      this.pendingTouchZoom = null;
-      if (zoom === null) {
-        return;
-      }
-      this.updateZoomLevel(zoom);
+      this.flushTouchZoom();
     });
   }
+  flushTouchZoom() {
+    const pending = this.pendingTouchZoom;
+    this.clearTouchZoomFrame();
+    if (pending && this.port.canApplyTouchZoom?.() !== false) {
+      this.updateZoomLevel(pending.zoom, { source: "touch", commitViewport: pending.commitViewport });
+    }
+  }
   queueOverviewWheel(deltaY) {
+    this.clearTouchZoomFrame();
     const factor = deltaY < 0 ? 1.06 : 1 / 1.06;
     this.pendingOverviewZoom = (this.pendingOverviewZoom ?? this.port.getZoom()) * factor;
     if (this.overviewZoomFrame !== null) {
@@ -28493,6 +28556,11 @@ function closestAnchor(target) {
   const element = node?.nodeType === 1 ? node : node?.parentElement;
   return element?.closest("a") ?? null;
 }
+function isInteractiveTarget(target) {
+  const node = target;
+  const element = node?.nodeType === 3 ? node.parentElement : target;
+  return Boolean(element?.closest?.("textarea, input, button, a, [contenteditable='true']"));
+}
 var TouchController = class {
   constructor(port) {
     this.port = port;
@@ -28503,7 +28571,6 @@ var TouchController = class {
     this.branchTouchPoints = /* @__PURE__ */ new Map();
     this.branchTouchStart = null;
     this.branchTouchPinching = false;
-    this.branchRevealFrame = null;
     this.disposers = [];
     this.boundViewports = /* @__PURE__ */ new Set();
   }
@@ -28525,13 +28592,18 @@ var TouchController = class {
       } : null;
     };
     const down = (event) => {
-      if (event.pointerType !== "touch" || this.port.hasEditingSession() || event.target?.closest("textarea, input, button, a, [contenteditable='true']")) return;
+      if (event.pointerType !== "touch" || this.port.hasEditingSession() || isInteractiveTarget(event.target)) return;
+      this.port.flushZoom?.();
       if (!this.touchPoints.size) this.touchMoved = false;
       this.touchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
       rebase();
       if (this.touchPoints.size > 1) this.touchMoved = true;
     };
     const move = (event) => {
+      if (this.port.hasEditingSession()) {
+        this.clearOverviewTouch(viewport);
+        return;
+      }
       if (!this.touchPoints.has(event.pointerId) || !this.touchStart) return;
       this.touchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
       const { midpoint, distance } = geometry();
@@ -28546,9 +28618,14 @@ var TouchController = class {
       const offset = this.port.getOverviewSceneOffset();
       if (this.touchPoints.size > 1) {
         const next = pinchViewport(this.touchStart, midpoint, distance, this.port.getZoomBounds?.());
-        this.port.scheduleZoom(next.zoom);
-        viewport.scrollLeft = next.left + offset.left;
-        viewport.scrollTop = next.top + offset.top;
+        const start = this.touchStart;
+        this.port.scheduleZoom(next.zoom, () => {
+          if (this.touchStart !== start) return;
+          const ratio = this.port.getZoom() / start.zoom;
+          const appliedOffset = this.port.getOverviewSceneOffset();
+          viewport.scrollLeft = (start.left + start.midpoint.x) * ratio - midpoint.x + appliedOffset.left;
+          viewport.scrollTop = (start.top + start.midpoint.y) * ratio - midpoint.y + appliedOffset.top;
+        });
       } else {
         viewport.scrollLeft = this.touchStart.left + offset.left - dx;
         viewport.scrollTop = this.touchStart.top + offset.top - dy;
@@ -28556,6 +28633,9 @@ var TouchController = class {
     };
     const end = (event) => {
       if (event.type === "lostpointercapture" && event.target !== viewport) return;
+      if (!this.touchPoints.has(event.pointerId)) return;
+      if (event.type === "pointerup") this.port.flushZoom?.();
+      else this.port.cancelZoom?.();
       if (!this.touchPoints.delete(event.pointerId)) return;
       if (this.touchMoved) this.suppressTouchClickUntil = Date.now() + 500;
       if (viewport.hasPointerCapture(event.pointerId)) viewport.releasePointerCapture(event.pointerId);
@@ -28565,38 +28645,67 @@ var TouchController = class {
     return this.bind(viewport, down, move, end, () => this.clearOverviewTouch(viewport));
   }
   bindBranchTouch(viewport) {
+    let nativeInput = false;
+    const midpoint = () => {
+      const [a, b] = Array.from(this.branchTouchPoints.values());
+      const bounds = viewport.getBoundingClientRect();
+      return { x: (a.x + b.x) / 2 - bounds.left, y: (a.y + b.y) / 2 - bounds.top };
+    };
     const distance = () => {
       const [a, b] = Array.from(this.branchTouchPoints.values());
       return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
     };
     const rebase = () => {
       this.branchTouchStart = this.branchTouchPoints.size > 1 ? { zoom: this.port.getZoom(), distance: distance() } : null;
+      if (this.branchTouchStart) {
+        this.branchTouchPinching = true;
+        viewport.addClass("is-touch-pinching");
+        this.port.beginBranchPinch?.(viewport, midpoint());
+      }
     };
-    const isInteractiveTarget = (target) => target instanceof Element && Boolean(target.closest("textarea, input, button, a, [contenteditable='true']"));
     const down = (event) => {
+      if (nativeInput) return;
       if (event.pointerType !== "touch" || !this.port.usesTouchControls() || this.port.hasEditingSession() || isInteractiveTarget(event.target)) {
         return;
       }
+      this.port.flushZoom?.();
       this.branchTouchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
       rebase();
     };
     const move = (event) => {
+      if (this.port.hasEditingSession()) {
+        this.clearBranchTouch(viewport);
+        nativeInput = false;
+        return;
+      }
+      if (nativeInput) return;
       if (!this.branchTouchPoints.has(event.pointerId) || !this.branchTouchStart || this.branchTouchPoints.size < 2) {
         return;
       }
       this.branchTouchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      viewport.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      zoomAtMidpoint();
+    };
+    const zoomAtMidpoint = () => {
+      if (!this.branchTouchStart || this.branchTouchPoints.size < 2) return;
       const nextZoom = resolvePinchZoom(this.branchTouchStart.zoom, this.branchTouchStart.distance, distance(), this.port.getZoomBounds?.());
       this.suppressTouchClickUntil = Date.now() + 500;
-      this.branchTouchPinching = true;
-      viewport.setPointerCapture(event.pointerId);
-      viewport.addClass("is-touch-pinching");
-      event.preventDefault();
-      this.port.scheduleZoom(nextZoom);
+      const start = this.branchTouchStart;
+      const center = midpoint();
+      this.port.scheduleZoom(nextZoom, () => {
+        if (this.branchTouchStart === start) this.port.commitBranchPinch?.(viewport, center);
+      });
     };
     const end = (event) => {
-      if (!this.branchTouchPoints.delete(event.pointerId)) {
+      if (nativeInput) return;
+      if (event.type === "lostpointercapture" && event.target !== viewport) return;
+      if (!this.branchTouchPoints.has(event.pointerId)) {
         return;
       }
+      if (event.type === "pointerup") this.port.flushZoom?.();
+      else this.port.cancelZoom?.();
+      this.branchTouchPoints.delete(event.pointerId);
       if (viewport.hasPointerCapture(event.pointerId)) {
         viewport.releasePointerCapture(event.pointerId);
       }
@@ -28604,21 +28713,68 @@ var TouchController = class {
         viewport.removeClass("is-touch-pinching");
         if (this.branchTouchPinching) {
           this.branchTouchPinching = false;
-          this.clearBranchRevealFrame();
-          const request = { owner: viewport.ownerDocument?.defaultView ?? window, id: 0 };
-          this.branchRevealFrame = request;
-          request.id = request.owner.requestAnimationFrame(() => {
-            if (this.branchRevealFrame !== request) {
-              return;
-            }
-            this.branchRevealFrame = null;
-            this.port.revealCompactSelection();
-          });
+          this.port.endBranchPinch?.();
         }
       }
       rebase();
     };
-    return this.bind(viewport, down, move, end, () => this.clearBranchTouch(viewport));
+    const readTouches = (event) => {
+      this.branchTouchPoints.clear();
+      for (const touch of Array.from(event.touches)) {
+        if (!touch.target || viewport.contains(touch.target)) {
+          this.branchTouchPoints.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+        }
+      }
+    };
+    const nativeStart = (event) => {
+      if (!this.port.usesTouchControls() || this.port.hasEditingSession() || isInteractiveTarget(event.target)) return;
+      this.port.flushZoom?.();
+      nativeInput = true;
+      readTouches(event);
+      rebase();
+      if (this.branchTouchPoints.size > 1) {
+        this.suppressTouchClickUntil = Date.now() + 500;
+        if (event.cancelable) event.preventDefault();
+      }
+    };
+    const nativeMove = (event) => {
+      if (this.port.hasEditingSession()) {
+        this.clearBranchTouch(viewport);
+        nativeInput = false;
+        return;
+      }
+      if (!nativeInput) return;
+      readTouches(event);
+      if (this.branchTouchPoints.size < 2) return;
+      if (event.cancelable) event.preventDefault();
+      zoomAtMidpoint();
+    };
+    const nativeEnd = (event) => {
+      if (!nativeInput) return;
+      if (event.type === "touchcancel") this.port.cancelZoom?.();
+      else this.port.flushZoom?.();
+      readTouches(event);
+      if (this.branchTouchPoints.size < 2) {
+        if (this.branchTouchPinching) this.suppressTouchClickUntil = Date.now() + 500;
+        this.branchTouchPinching = false;
+        viewport.removeClass("is-touch-pinching");
+        this.port.endBranchPinch?.();
+      }
+      nativeInput = this.branchTouchPoints.size > 0;
+      rebase();
+    };
+    viewport.addEventListener("touchstart", nativeStart, { passive: false });
+    viewport.addEventListener("touchmove", nativeMove, { passive: false });
+    viewport.addEventListener("touchend", nativeEnd);
+    viewport.addEventListener("touchcancel", nativeEnd);
+    return this.bind(viewport, down, move, end, () => {
+      viewport.removeEventListener("touchstart", nativeStart);
+      viewport.removeEventListener("touchmove", nativeMove);
+      viewport.removeEventListener("touchend", nativeEnd);
+      viewport.removeEventListener("touchcancel", nativeEnd);
+      nativeInput = false;
+      this.clearBranchTouch(viewport);
+    });
   }
   isBranchPinching() {
     return this.branchTouchPinching;
@@ -28633,7 +28789,6 @@ var TouchController = class {
     this.branchTouchPoints.clear();
     this.branchTouchStart = null;
     this.branchTouchPinching = false;
-    this.clearBranchRevealFrame();
     this.boundViewports.clear();
   }
   bind(viewport, down, move, end, clearGesture) {
@@ -28719,6 +28874,7 @@ var TouchController = class {
     return dispose;
   }
   clearOverviewTouch(viewport) {
+    this.port.cancelZoom?.();
     this.releaseCaptures(viewport, this.touchPoints);
     this.touchPoints.clear();
     this.touchStart = null;
@@ -28726,22 +28882,17 @@ var TouchController = class {
     viewport.removeClass("is-panning");
   }
   clearBranchTouch(viewport) {
+    this.port.cancelZoom?.();
+    this.port.endBranchPinch?.();
     this.releaseCaptures(viewport, this.branchTouchPoints);
     this.branchTouchPoints.clear();
     this.branchTouchStart = null;
     this.branchTouchPinching = false;
-    this.clearBranchRevealFrame();
     viewport.removeClass("is-touch-pinching");
   }
   releaseCaptures(viewport, points) {
     for (const pointerId of points.keys()) {
       if (viewport.hasPointerCapture(pointerId)) viewport.releasePointerCapture(pointerId);
-    }
-  }
-  clearBranchRevealFrame() {
-    if (this.branchRevealFrame !== null) {
-      this.branchRevealFrame.owner.cancelAnimationFrame(this.branchRevealFrame.id);
-      this.branchRevealFrame = null;
     }
   }
 };
@@ -30250,6 +30401,79 @@ var OutputProfileLabel = class {
   }
 };
 
+// src/view/chrome/MobileViewportController.ts
+var MobileViewportController = class {
+  constructor(root, resize) {
+    this.root = root;
+    this.resize = resize;
+    this.frame = null;
+    this.disposed = false;
+    this.transition = (event) => {
+      const target = event.target;
+      if (target?.matches?.(".mobile-navbar, .mobile-toolbar")) this.schedule();
+    };
+    this.schedule = () => {
+      if (this.disposed || this.frame !== null) return;
+      this.frame = this.owner.requestAnimationFrame(() => {
+        this.frame = null;
+        if (!this.disposed) this.resize();
+      });
+    };
+    this.owner = root.win;
+    this.viewport = this.owner.visualViewport;
+    this.observer = new root.win.ResizeObserver(() => this.schedule());
+    this.observer.observe(root);
+    root.ownerDocument.querySelectorAll(".mobile-navbar, .mobile-toolbar").forEach((bar) => this.observer.observe(bar));
+    this.viewport?.addEventListener("resize", this.schedule);
+    this.viewport?.addEventListener("scroll", this.schedule);
+    this.owner.addEventListener("resize", this.schedule);
+    root.ownerDocument.addEventListener("transitionend", this.transition, true);
+    this.schedule();
+  }
+  dispose() {
+    this.disposed = true;
+    if (this.frame !== null) this.owner.cancelAnimationFrame(this.frame);
+    this.frame = null;
+    this.observer.disconnect();
+    this.viewport?.removeEventListener("resize", this.schedule);
+    this.viewport?.removeEventListener("scroll", this.schedule);
+    this.owner.removeEventListener("resize", this.schedule);
+    this.root.ownerDocument.removeEventListener("transitionend", this.transition, true);
+  }
+};
+
+// src/view/chrome/mobileViewportGeometry.ts
+function intersectVisibleRects(rects) {
+  if (!rects.length || rects.some((rect) => !Object.values(rect).every(Number.isFinite))) return null;
+  const intersection = {
+    left: Math.max(...rects.map((rect) => rect.left)),
+    top: Math.max(...rects.map((rect) => rect.top)),
+    right: Math.min(...rects.map((rect) => rect.right)),
+    bottom: Math.min(...rects.map((rect) => rect.bottom))
+  };
+  return intersection.right > intersection.left && intersection.bottom > intersection.top ? intersection : null;
+}
+function mobileViewportHeight(root) {
+  const owner = root.win;
+  const viewport = owner.visualViewport;
+  const pane = root.getBoundingClientRect();
+  const visible = intersectVisibleRects([pane, {
+    left: viewport?.offsetLeft ?? 0,
+    top: viewport?.offsetTop ?? 0,
+    right: (viewport?.offsetLeft ?? 0) + (viewport?.width ?? owner.innerWidth),
+    bottom: (viewport?.offsetTop ?? 0) + (viewport?.height ?? owner.innerHeight)
+  }]);
+  if (!visible) return 0;
+  let bottom = visible.bottom;
+  for (const bar of Array.from(root.ownerDocument.querySelectorAll(".mobile-navbar, .mobile-toolbar"))) {
+    const bounds = bar.getBoundingClientRect();
+    const style = owner.getComputedStyle(bar);
+    if (bar.isConnected && bounds.height > 0 && bounds.left <= visible.left + 1 && bounds.right >= visible.right - 1 && bounds.top >= visible.top && bounds.top < bottom && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0) bottom = bounds.top;
+  }
+  const padding = owner.getComputedStyle(root);
+  return Math.max(0, bottom - Math.max(visible.top, pane.top + (parseFloat(padding.paddingTop) || 0)) - (parseFloat(padding.paddingBottom) || 0));
+}
+
 // src/view/chrome/ViewShell.ts
 var ViewShell = class {
   constructor(contentEl, port) {
@@ -30261,6 +30485,8 @@ var ViewShell = class {
     this.disposeBranchViewport = null;
     this.outputProfileLabel = null;
     this.compactLayout = false;
+    this.mobileViewport = null;
+    this.mobileWidth = 0;
     this.work = new ViewWorkScope();
     this.elements = this.emptyElements();
   }
@@ -30276,6 +30502,7 @@ var ViewShell = class {
     this.outputProfileLabel = null;
     this.contentEl.empty();
     this.contentEl.addClass("arbor-view");
+    this.mobileViewport ?? (this.mobileViewport = new MobileViewportController(this.contentEl, () => this.handleMobileResize()));
     this.applyViewClasses(this.contentEl);
     const frameEl = this.contentEl.createDiv({ cls: "arbor-frame" });
     const breadcrumbsEl = frameEl.createDiv({ cls: "arbor-breadcrumbs" });
@@ -30395,7 +30622,7 @@ var ViewShell = class {
     });
     this.touchDockEl = dock;
     this.contentEl.toggleClass("is-touch-editing", Boolean(this.port.getSession()));
-    this.work.frame(window, () => this.handleMobileResize());
+    this.mobileViewport?.schedule();
     dock.empty();
     const button = (label, icon, action, disabled = false, text = false) => {
       const el = dock.createEl("button", {
@@ -30526,22 +30753,21 @@ var ViewShell = class {
       this.port.onCompactChange(compact);
     }
     if (!this.usesTouchControls()) return;
+    const height = `${mobileViewportHeight(this.contentEl)}px`;
+    if (this.contentEl.style.getPropertyValue("--arbor-mobile-height") === height && this.mobileWidth === this.contentEl.clientWidth) return;
+    this.mobileWidth = this.contentEl.clientWidth;
+    this.contentEl.setCssProps({ "--arbor-mobile-height": height });
     this.port.resizeEditors();
-    const viewport = this.contentEl.ownerDocument.defaultView?.visualViewport;
-    const rect = this.contentEl.getBoundingClientRect();
-    let bottom = Math.min(rect.bottom - 8, (viewport?.height ?? window.innerHeight) + (viewport?.offsetTop ?? 0));
-    if (import_obsidian13.Platform.isMobile) this.contentEl.ownerDocument.querySelectorAll(".mobile-navbar, .mobile-toolbar").forEach((bar) => {
-      const bounds = bar.getBoundingClientRect();
-      if (bounds.height > 0 && bounds.width > 0 && bounds.top > rect.top && bounds.top < bottom && bounds.right > rect.left && bounds.left < rect.right && getComputedStyle(bar).visibility !== "hidden") bottom = bounds.top - 8;
-    });
-    this.contentEl.setCssProps({ "--arbor-mobile-height": `${Math.max(120, bottom - rect.top - 8)}px` });
     this.port.onResizeDuringEdit();
+    this.contentEl.dispatchEvent(new this.contentEl.win.Event("arbor:viewport-resize"));
   }
   showMode(mode) {
     this.elements.outputStageEl?.setCssStyles({ display: mode === "output" ? "" : "none" });
     this.elements.columnsStageEl?.setCssStyles({ display: mode === "editor" ? "" : "none" });
   }
   teardownShell() {
+    this.mobileViewport?.dispose();
+    this.mobileViewport = null;
     this.outputProfileLabel?.dispose();
     this.outputProfileLabel = null;
     this.work.reset();
@@ -31184,6 +31410,23 @@ var ContentIngestionController = class {
 
 // src/view/ingestion/ContentIngestionRouting.ts
 var import_obsidian15 = require("obsidian");
+
+// src/view/ingestion/dropOptionsGeometry.ts
+function fitDropOptions(input) {
+  const { bounds, preferred } = input;
+  for (const layout of ["stack", "row"]) {
+    const size = layout === "stack" ? input.stackSize : input.rowSize;
+    if (!Object.values(size).every(Number.isFinite) || size.width < (layout === "row" ? 96 : 44) || size.height < 44 || size.width > bounds.right - bounds.left || size.height > bounds.bottom - bounds.top) continue;
+    return {
+      x: Math.max(bounds.left, Math.min(preferred.x, bounds.right - size.width)),
+      y: Math.max(bounds.top, Math.min(preferred.y, bounds.bottom - size.height)),
+      layout
+    };
+  }
+  return null;
+}
+
+// src/view/ingestion/ContentIngestionRouting.ts
 function elementFromTarget(target) {
   const node = target;
   return node?.nodeType === 1 ? node : node?.parentElement ?? null;
@@ -31227,9 +31470,10 @@ var ContentIngestionRouting = class {
     root.addEventListener("dragend", end, true);
     root.addEventListener("dragleave", leave, true);
     root.addEventListener("scroll", reposition, true);
+    root.addEventListener("arbor:viewport-resize", reposition);
     root.ownerDocument.addEventListener("drop", outsideDrop);
     root.ownerDocument.addEventListener("dragend", end);
-    root.win.addEventListener("resize", end);
+    root.win.addEventListener("resize", reposition);
     root.win.addEventListener("blur", end);
     this.dispose = () => {
       root.removeEventListener("dragover", over, true);
@@ -31239,9 +31483,10 @@ var ContentIngestionRouting = class {
       root.removeEventListener("dragend", end, true);
       root.removeEventListener("dragleave", leave, true);
       root.removeEventListener("scroll", reposition, true);
+      root.removeEventListener("arbor:viewport-resize", reposition);
       root.ownerDocument.removeEventListener("drop", outsideDrop);
       root.ownerDocument.removeEventListener("dragend", end);
-      root.win.removeEventListener("resize", end);
+      root.win.removeEventListener("resize", reposition);
       root.win.removeEventListener("blur", end);
     };
   }
@@ -31359,7 +31604,7 @@ var ContentIngestionRouting = class {
     return rect.width > 0 && rect.height > 0 && Number.isFinite(point.clientX) && Number.isFinite(point.clientY) && point.clientX >= rect.left && point.clientX < rect.right && point.clientY >= rect.top && point.clientY < rect.bottom;
   }
   zoneAt(target, point) {
-    if (!this.options?.isConnected || !this.anchor?.isConnected) return null;
+    if (!this.options?.isConnected || this.options.hidden || !this.anchor?.isConnected) return null;
     const zone = elementFromTarget(target)?.closest("[data-new-block-kind]");
     if (zone && this.options.contains(zone) && (zone.dataset.newBlockKind === "child" || zone.dataset.newBlockKind === "sibling")) return zone;
     if (!point) return null;
@@ -31404,16 +31649,32 @@ var ContentIngestionRouting = class {
       this.clearOptions();
       return;
     }
-    const bounds = viewport.getBoundingClientRect();
+    const pane = viewport.getBoundingClientRect();
     const card = this.anchor.getBoundingClientRect();
     const origin = root.getBoundingClientRect();
-    const width = Math.min(232, Math.max(0, bounds.width - 16));
-    const height = this.options.offsetHeight || 112;
     const inset = 8;
-    const minX = Math.max(bounds.left, origin.left) + inset;
-    const maxX = Math.max(minX, Math.min(bounds.right, origin.right) - width - inset);
-    const minY = Math.max(bounds.top, origin.top) + inset;
-    const maxY = Math.max(minY, Math.min(bounds.bottom, origin.bottom) - height - inset);
+    const visible = intersectVisibleRects([pane, origin]);
+    if (!visible) {
+      this.options.hidden = true;
+      return;
+    }
+    const dock = root.querySelector(".arbor-touch-dock")?.getBoundingClientRect();
+    if (dock && dock.width > 0 && dock.top > visible.top && dock.top < visible.bottom) visible.bottom = dock.top;
+    const bounds = { left: visible.left + inset, right: visible.right - inset, top: visible.top + inset, bottom: visible.bottom - inset };
+    const width = Math.min(232, Math.max(0, bounds.right - bounds.left));
+    this.options.hidden = false;
+    this.options.dataset.layout = "stack";
+    this.options.setCssProps({ "--arbor-drop-options-width": `${width}px` });
+    const stackSize = { width, height: this.options.offsetHeight || 112 };
+    this.options.dataset.layout = "row";
+    const rowWidth = Math.min(464, Math.max(0, bounds.right - bounds.left));
+    this.options.setCssProps({ "--arbor-drop-options-width": `${rowWidth}px` });
+    const rowSize = { width: rowWidth, height: this.options.offsetHeight || 64 };
+    const height = stackSize.height;
+    const minX = bounds.left;
+    const maxX = bounds.right - width;
+    const minY = bounds.top;
+    const maxY = bounds.bottom - height;
     const horizontal = this.port.getOrientation() === "horizontal";
     let x = horizontal && this.port.getDirection() === "rtl" ? card.left - width - inset : horizontal ? card.right + inset : card.left;
     let y = horizontal ? card.top : this.port.getOrientation() === "vertical-bottom-up" ? card.top - height - inset : card.bottom + inset;
@@ -31427,10 +31688,17 @@ var ContentIngestionRouting = class {
       if (below >= minY && below <= maxY) y = below;
       else if (above >= minY && above <= maxY) y = above;
     }
+    const fitted = fitDropOptions({ bounds, preferred: { x, y }, stackSize, rowSize });
+    this.options.hidden = !fitted;
+    if (!fitted) {
+      this.highlight(null);
+      return;
+    }
+    this.options.dataset.layout = fitted.layout;
     this.options.setCssProps({
-      "--arbor-drop-options-x": `${Math.min(maxX, Math.max(minX, x)) - origin.left + root.scrollLeft - root.clientLeft}px`,
-      "--arbor-drop-options-y": `${Math.min(maxY, Math.max(minY, y)) - origin.top + root.scrollTop - root.clientTop}px`,
-      "--arbor-drop-options-width": `${width}px`
+      "--arbor-drop-options-x": `${fitted.x - origin.left + root.scrollLeft - root.clientLeft}px`,
+      "--arbor-drop-options-y": `${fitted.y - origin.top + root.scrollTop - root.clientTop}px`,
+      "--arbor-drop-options-width": `${fitted.layout === "stack" ? width : rowWidth}px`
     });
   }
   highlight(card) {
@@ -31751,6 +32019,7 @@ var ArborView = class extends import_obsidian16.FileView {
       getZoom: () => this.getViewSettings().zoomLevel
     });
     this.zoomController = new ZoomController({
+      canApplyTouchZoom: () => this.editor.getSession() === null,
       getWindow: () => this.contentEl.win,
       getZoom: () => this.getViewSettings().zoomLevel,
       getZoomBounds: () => this.getZoomBounds(),
@@ -31765,7 +32034,7 @@ var ArborView = class extends import_obsidian16.FileView {
       },
       flashIndicator: () => this.flashZoomIndicator(),
       hideIndicator: () => this.hideZoomIndicator(),
-      afterZoom: () => this.afterZoom()
+      afterZoom: (source) => this.afterZoom(source)
     });
     this.activeZoom = new ActiveZoomController({
       prepareTarget: (target) => {
@@ -31808,7 +32077,15 @@ var ArborView = class extends import_obsidian16.FileView {
     this.touchController = new TouchController({
       getZoom: () => this.getViewSettings().zoomLevel,
       getZoomBounds: () => this.getZoomBounds(),
-      scheduleZoom: (value) => this.zoomController.scheduleTouchZoom(value),
+      scheduleZoom: (value, commit) => this.zoomController.scheduleTouchZoom(value, commit),
+      flushZoom: () => this.zoomController.flushTouchZoom(),
+      cancelZoom: () => this.zoomController.clearTouchZoomFrame(),
+      beginBranchPinch: (viewport, midpoint) => {
+        this.activeZoom.disable();
+        this.branchViewport.beginBranchPinch(viewport, midpoint);
+      },
+      commitBranchPinch: (viewport, midpoint) => this.branchViewport.commitBranchPinch(viewport, midpoint),
+      endBranchPinch: () => this.branchViewport.endBranchPinch(),
       hasEditingSession: () => this.editor.getSession() !== null,
       usesTouchControls: () => this.usesTouchControls,
       getOverviewSceneOffset: () => ({
@@ -32077,15 +32354,6 @@ var ArborView = class extends import_obsidian16.FileView {
         runAsyncAction(this.commitEditIfNeeded(), (error2) => this.reportActionError(error2));
       }
     });
-    const observer = new ResizeObserver(() => this.handleMobileResize());
-    observer.observe(this.contentEl);
-    this.register(() => observer.disconnect());
-    const visualViewport = doc.defaultView?.visualViewport;
-    if (visualViewport) {
-      const onResize = () => this.handleMobileResize();
-      visualViewport.addEventListener("resize", onResize);
-      this.register(() => visualViewport.removeEventListener("resize", onResize));
-    }
   }
   get editingSession() {
     return this.editor.getSession();
@@ -33756,9 +34024,13 @@ var ArborView = class extends import_obsidian16.FileView {
     this.selectBlock(blockId);
     await callback();
   }
-  afterZoom() {
+  afterZoom(source = "manual") {
     if (this.presentationMode === "overview") {
       this.syncOverviewZoom();
+      return;
+    }
+    if (source === "touch") {
+      this.syncViewportEdgeFades();
       return;
     }
     if (this.compactLayout) {
