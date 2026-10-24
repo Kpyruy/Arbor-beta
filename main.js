@@ -28152,25 +28152,25 @@ var BranchViewportController = class {
       if (!target) return;
       if (this.port.usesTouchControls?.() && !this.port.isCompact()) {
         this.touchColumns.align(list, target, activeZoom);
-        return;
+      } else {
+        const natural = this.getElementOffsetTopWithin(target, resolvedColumns) + target.offsetHeight / 2;
+        const preferred = depth === 0 ? rootAnchor : centers.get(depth - 1) ?? natural;
+        const anchor = target.classList.contains("is-active") ? clampCardCenter(preferred, target.offsetHeight, viewportRect.top - rootRect.top, resolvedViewport.clientHeight) : preferred;
+        const shift = anchor - natural;
+        const previous = this.alignments.get(list);
+        const stableAncestor = previous?.target === target && !target.classList.contains("is-active") && Math.abs(previous.natural - natural) > 0.25 && !list.classList.contains("is-rebinding");
+        if (stableAncestor) list.classList.add("is-alignment-stable");
+        list.setCssProps({ "--arbor-card-list-offset-y": Math.abs(shift) < 0.25 ? "0px" : `${shift}px` });
+        if (stableAncestor) {
+          list.getBoundingClientRect();
+          list.classList.remove("is-alignment-stable");
+        }
+        this.alignments.set(list, { target, natural });
+        centers.set(depth, natural + shift);
       }
-      const natural = this.getElementOffsetTopWithin(target, resolvedColumns) + target.offsetHeight / 2;
-      const preferred = depth === 0 ? rootAnchor : centers.get(depth - 1) ?? natural;
-      const anchor = target.classList.contains("is-active") ? clampCardCenter(preferred, target.offsetHeight, viewportRect.top - rootRect.top, resolvedViewport.clientHeight) : preferred;
-      const shift = anchor - natural;
-      const previous = this.alignments.get(list);
-      const stableAncestor = previous?.target === target && !target.classList.contains("is-active") && Math.abs(previous.natural - natural) > 0.25 && !list.classList.contains("is-rebinding");
-      if (stableAncestor) list.classList.add("is-alignment-stable");
-      list.setCssProps({ "--arbor-card-list-offset-y": Math.abs(shift) < 0.25 ? "0px" : `${shift}px` });
-      if (stableAncestor) {
-        list.getBoundingClientRect();
-        list.classList.remove("is-alignment-stable");
-      }
-      this.alignments.set(list, { target, natural });
       if (list.classList.contains("is-rebinding")) {
         window.requestAnimationFrame(() => list.classList.remove("is-rebinding"));
       }
-      centers.set(depth, natural + shift);
     });
   }
   handleViewportPointerDown(event, viewport) {

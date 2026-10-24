@@ -2897,8 +2897,13 @@
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior-y: contain;
-  scrollbar-width: thin;
+  scrollbar-width: none;
   transform: none;
+}
+.arbor-view.has-touch-controls:not(.is-compact) .arbor-card-list::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 .arbor-view.has-touch-controls:not(.is-compact) .arbor-card { flex-shrink: 0; }
 .arbor-view.has-touch-controls:not(.is-compact) .arbor-card.is-active .arbor-card-content { overscroll-behavior-y: auto; }
