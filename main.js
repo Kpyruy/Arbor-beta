@@ -7029,6 +7029,10 @@ var OVERVIEW_ORIENTATION_OPTIONS = {
   "vertical-bottom-up": "Vertical \u2014 root at bottom",
   "vertical-top-down": "Vertical \u2014 root at top"
 };
+var ACTIVE_CARD_HEIGHT_OPTIONS = { bounded: "Limited height", content: "Fit content" };
+function normalizeActiveCardHeightMode(value) {
+  return value === "content" ? "content" : "bounded";
+}
 var DEFAULT_SETTINGS = {
   layoutDirection: "ltr",
   overviewOrientation: "horizontal",
@@ -7038,6 +7042,7 @@ var DEFAULT_SETTINGS = {
   splitDirection: "vertical",
   cardWidth: 300,
   cardMinHeight: 120,
+  activeCardHeightMode: "bounded",
   horizontalSpacing: 20,
   verticalSpacing: 12,
   zoomLevel: 1,
@@ -7113,6 +7118,11 @@ var ArborSettingTab = class extends import_obsidian2.PluginSettingTab {
       },
       this.sliderDefinition("Card width", "Card width in pixels.", "cardWidth", 220, 520, 10),
       this.sliderDefinition("Card minimum height", "Minimum card height in pixels.", "cardMinHeight", 80, 300, 10),
+      {
+        name: "Active card height",
+        desc: "Branch editor: fit content scrolls the whole card in its column. Limited height scrolls long text inside the card. Inactive previews stay compact.",
+        control: { type: "dropdown", key: "activeCardHeightMode", options: ACTIVE_CARD_HEIGHT_OPTIONS, defaultValue: DEFAULT_SETTINGS.activeCardHeightMode }
+      },
       this.sliderDefinition("Horizontal spacing", "Space between columns in pixels.", "horizontalSpacing", 8, 48, 2),
       this.sliderDefinition("Vertical spacing", "Space between cards in pixels.", "verticalSpacing", 4, 32, 2),
       this.sliderDefinition("Minimum zoom", "Lowest scene zoom, between 25% and the maximum zoom.", "minZoomLevel", 25, this.plugin.settings.maxZoomLevel * 100, 5, "%"),
@@ -7173,9 +7183,11 @@ var ArborSettingTab = class extends import_obsidian2.PluginSettingTab {
       this.plugin.refreshAllBranchViews();
       return;
     }
-    settings[key] = key === "overviewOrientation" ? normalizeOverviewOrientation2(value) ?? "horizontal" : key === "breadcrumbLabelPreferredPrefix" && typeof value === "string" ? value.trim() : value;
+    settings[key] = key === "overviewOrientation" ? normalizeOverviewOrientation2(value) ?? "horizontal" : key === "activeCardHeightMode" ? normalizeActiveCardHeightMode(value) : key === "breadcrumbLabelPreferredPrefix" && typeof value === "string" ? value.trim() : value;
     await this.plugin.saveSettings();
-    if (key === "overviewOrientation") {
+    if (key === "activeCardHeightMode") {
+      this.plugin.refreshAllBranchViews({ activeCardHeightChanged: true });
+    } else if (key === "overviewOrientation") {
       this.plugin.refreshOverviewOrientations();
     } else if (key === "layoutDirection") {
       this.plugin.refreshAllBranchViews({ layoutDirectionChanged: true });
@@ -7219,6 +7231,14 @@ var ArborSettingTab = class extends import_obsidian2.PluginSettingTab {
     }
     this.addNumericSetting(containerEl, "Card width", "Card width in pixels.", "cardWidth", 220, 520, 10);
     this.addNumericSetting(containerEl, "Card minimum height", "Minimum card height in pixels.", "cardMinHeight", 80, 300, 10);
+    new import_obsidian2.Setting(containerEl).setName("Active card height").setDesc("Branch editor: fit content scrolls the whole card in its column. Limited height scrolls long text inside the card. Inactive previews stay compact.").addDropdown((dropdown) => {
+      Object.entries(ACTIVE_CARD_HEIGHT_OPTIONS).forEach(([value, label]) => {
+        dropdown.addOption(value, label);
+      });
+      dropdown.setValue(this.plugin.settings.activeCardHeightMode).onChange((value) => {
+        void this.setControlValue("activeCardHeightMode", value);
+      });
+    });
     this.addNumericSetting(containerEl, "Horizontal spacing", "Space between columns in pixels.", "horizontalSpacing", 8, 48, 2);
     this.addNumericSetting(containerEl, "Vertical spacing", "Space between cards in pixels.", "verticalSpacing", 4, 32, 2);
     this.addNumericSetting(containerEl, "Minimum zoom", "Lowest scene zoom, between 25% and the maximum zoom.", "minZoomLevel", 25, this.plugin.settings.maxZoomLevel * 100, 5, "%");
@@ -27898,9 +27918,14 @@ var TouchColumnViewport = class {
     position.paddingBottom = bottom;
   }
   targetTop({ list, target }) {
-    const top = list.scrollTop + target.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    const top = this.layoutTop(target) - this.layoutTop(list);
     const desired = target.offsetHeight > list.clientHeight - 48 ? top - 24 : top + target.offsetHeight / 2 - list.clientHeight * 0.44;
     return Math.max(0, Math.min(desired, list.scrollHeight - list.clientHeight));
+  }
+  layoutTop(element) {
+    let top = 0;
+    for (let node = element; node; node = node.offsetParent) top += node.offsetTop;
+    return top;
   }
   prune() {
     for (const [list, position] of this.positions) {
@@ -27925,6 +27950,9 @@ var BranchViewportController = class {
     this.pinch = null;
     this.touchColumns = new TouchColumnViewport();
   }
+  usesNativeColumnScroll() {
+    return !this.port.isCompact() && (this.port.usesTouchControls?.() === true || this.port.read.getSettings().activeCardHeightMode === "content");
+  }
   beginBranchPinch(viewport, midpoint) {
     this.stopHorizontalScrollMotion(false);
     if (this.layoutFrame !== null) window.cancelAnimationFrame(this.layoutFrame);
@@ -27937,7 +27965,7 @@ var BranchViewportController = class {
       this.pinch = null;
       return;
     }
-    const vertical = this.port.usesTouchControls?.() && !this.port.isCompact() ? card.closest(".arbor-card-list") ?? viewport : viewport;
+    const vertical = this.usesNativeColumnScroll() ? card.closest(".arbor-card-list") ?? viewport : viewport;
     this.touchColumns.pause(true);
     const before = card.getBoundingClientRect();
     this.pinch = { viewport, vertical, card, before, midpoint, fraction: {
@@ -28086,7 +28114,7 @@ var BranchViewportController = class {
       this.revealCompactSelection();
       return;
     }
-    if (this.port.usesTouchControls?.()) {
+    if (this.usesNativeColumnScroll()) {
       const list = card.closest(".arbor-card-list");
       if (list) this.touchColumns.align(list, card, snap, true);
     }
@@ -28150,7 +28178,7 @@ var BranchViewportController = class {
       const block = path[depth];
       const target = (activeZoom ? column.querySelector(".arbor-card.is-active") : null) ?? (block ? column.querySelector(`.arbor-card[data-block-id="${block.id}"]`) : null) ?? column.querySelector(".arbor-column-empty") ?? fallback;
       if (!target) return;
-      if (this.port.usesTouchControls?.() && !this.port.isCompact()) {
+      if (this.usesNativeColumnScroll()) {
         this.touchColumns.align(list, target, activeZoom);
       } else {
         const natural = this.getElementOffsetTopWithin(target, resolvedColumns) + target.offsetHeight / 2;
@@ -28590,7 +28618,7 @@ var ActiveZoomController = class {
       const fit = Math.max(min, Math.min(
         max,
         (current.viewport.clientWidth - 48) / size.width,
-        (current.viewport.clientHeight - 48) / size.height
+        this.port.getFitMode?.() === "width" ? Infinity : (current.viewport.clientHeight - 48) / size.height
       ));
       const next = Math.round(fit * 1e3) / 1e3;
       if (Math.abs(next - zoom) >= 3e-3) {
@@ -28637,15 +28665,19 @@ function measureBranchCard(card, resizeEditor) {
   if (!column) return { width: card.offsetWidth, height: card.offsetHeight };
   const zoom = column.style.getPropertyValue("--bw-zoom");
   const contentZoom = column.style.getPropertyValue("--bw-content-zoom");
+  const columns = column.closest(".arbor-columns");
+  const sceneZoom = columns?.style.getPropertyValue("--bw-zoom") ?? "";
   const editor = card.querySelector("textarea.arbor-editor");
   const editorHeight = editor?.style.getPropertyValue("--arbor-editor-height") ?? "";
   const scroller = editor ?? card.querySelector(".arbor-card-content");
   const scroll = { left: scroller?.scrollLeft ?? 0, top: scroller?.scrollTop ?? 0 };
   try {
+    columns?.setCssProps({ "--bw-zoom": "1" });
     column.setCssProps({ "--bw-zoom": "1", "--bw-content-zoom": "1" });
     if (editor) resizeEditor(editor);
     return { width: card.offsetWidth, height: card.offsetHeight };
   } finally {
+    columns?.setCssProps({ "--bw-zoom": sceneZoom });
     column.setCssProps({ "--bw-zoom": zoom, "--bw-content-zoom": contentZoom });
     editor?.setCssProps({ "--arbor-editor-height": editorHeight });
     if (scroller) {
@@ -29035,6 +29067,7 @@ function routeBranchViewportWheel(event, viewport, renderer, read, actions, comp
     actions.updateZoomLevel(settings.zoomLevel * factor);
     return;
   }
+  if (settings.activeCardHeightMode === "content") return;
   const hoveredColumn = renderer.getColumnAtPointerX(event.clientX);
   const wheelNavigation = resolveColumnWheelNavigation(
     event.deltaX,
@@ -30841,6 +30874,7 @@ var ViewShell = class {
     this.compactLayout = useCompactLayout(root.clientWidth);
     root.toggleClass("is-compact", this.compactLayout);
     root.toggleClass("has-touch-controls", this.usesTouchControls());
+    root.toggleClass("is-content-height", this.port.read.getSettings().activeCardHeightMode === "content");
     root.classList.add("is-context-dim-mode");
     const direction = this.port.read.getSettings().layoutDirection;
     root.classList.toggle("is-rtl", direction === "rtl");
@@ -32151,6 +32185,7 @@ var ArborView = class extends import_obsidian16.FileView {
         }
       },
       getNaturalSize: (target) => this.presentationMode === "overview" ? { width: target.card.offsetWidth, height: target.card.offsetHeight } : measureBranchCard(target.card, (editor) => this.editor.resizeEditor(editor)),
+      getFitMode: () => this.presentationMode === "editor" && this.getViewSettings().activeCardHeightMode === "content" ? "width" : "card",
       getTarget: () => this.getActiveZoomTarget(),
       getZoom: () => this.getViewSettings().zoomLevel,
       getBounds: () => this.getZoomBounds(),
@@ -32872,6 +32907,12 @@ var ArborView = class extends import_obsidian16.FileView {
       return;
     }
     await this.onLoadFile(file);
+  }
+  refreshCardHeightMode() {
+    this.branchViewport.reset();
+    this.pendingFocusBlockId = null;
+    this.pendingScrollBlockId = this.state?.selectedBlockId ?? null;
+    this.render();
   }
   async refreshView() {
     if (!this.file) {
@@ -34319,6 +34360,7 @@ var ArborPlugin = class extends import_obsidian17.Plugin {
     this.settings.maxZoomLevel = bounds.max;
     this.settings.zoomLevel = clampZoomLevel(settings.zoomLevel, bounds);
     this.settings.overviewOrientation = normalizeOverviewOrientation2(settings.overviewOrientation) ?? "horizontal";
+    this.settings.activeCardHeightMode = normalizeActiveCardHeightMode(settings.activeCardHeightMode);
     this.settings.layoutDirection = resolveInitialLayoutDirection({
       hasStoredPluginData: !this.isFreshPluginInstall,
       savedDirection: this.getStoredLayoutDirection(raw),
@@ -34379,6 +34421,10 @@ var ArborPlugin = class extends import_obsidian17.Plugin {
   }
   refreshAllBranchViews(options) {
     this.getBranchViews().forEach((view) => {
+      if (options?.activeCardHeightChanged) {
+        view.refreshCardHeightMode();
+        return;
+      }
       if (options?.layoutDirectionChanged) {
         void view.refreshLayoutDirection().catch((error2) => console.error("[Arbor] Could not refresh layout", error2));
         return;
